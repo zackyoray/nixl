@@ -68,6 +68,7 @@
 #define XFERBENCH_BACKEND_UCX_MO "UCX_MO"
 #define XFERBENCH_BACKEND_GDS "GDS"
 #define XFERBENCH_BACKEND_POSIX "POSIX"
+#define XFERBENCH_BACKEND_HF3FS "HF3FS"
 
 // POSIX API types
 #define XFERBENCH_POSIX_API_AIO "AIO"
@@ -128,6 +129,7 @@ class xferBenchConfig {
         static std::string posix_api_type;
         static std::string posix_filepath;
         static bool storage_enable_direct;
+        static std::string hf3fs_filepath;
 
         static int loadFromFlags();
         static void printConfig();

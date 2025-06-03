@@ -77,7 +77,10 @@ DEFINE_string(etcd_endpoints, "http://localhost:2379", "ETCD server endpoints fo
 // POSIX options - only used when backend is POSIX
 DEFINE_string(posix_api_type, XFERBENCH_POSIX_API_AIO, "API type for POSIX operations [AIO, URING] (only used with POSIX backend)");
 DEFINE_string(posix_filepath, "", "File path for POSIX operations (only used with POSIX backend)");
-DEFINE_bool(storage_enable_direct, false, "Enable direct I/O for storage operations (only used with POSIX backend)");
+DEFINE_bool(storage_enable_direct, false, "Enable direct I/O for storage operations (only used with POSIX and HF3FS backend)");
+
+// HF3FS only options - only used when backend is HF3FS
+DEFINE_string(hf3fs_filepath, "/mnt/3fs", "3FS root path");
 
 std::string xferBenchConfig::runtime_type = "";
 std::string xferBenchConfig::worker_type = "";
@@ -108,6 +111,8 @@ int xferBenchConfig::num_files = 0;
 std::string xferBenchConfig::posix_api_type = "";
 std::string xferBenchConfig::posix_filepath = "";
 bool xferBenchConfig::storage_enable_direct = false;
+
+std::string xferBenchConfig::hf3fs_filepath = "";
 
 int xferBenchConfig::loadFromFlags() {
     runtime_type = FLAGS_runtime_type;
@@ -141,6 +146,14 @@ int xferBenchConfig::loadFromFlags() {
                 return -1;
             }
         }
+
+        // Load HD3FS-specific configurations if backend is HD3FS
+        if (backend == XFERBENCH_BACKEND_HF3FS) {
+            hf3fs_filepath = FLAGS_hf3fs_filepath;
+            storage_enable_direct = FLAGS_storage_enable_direct;
+            num_files = FLAGS_num_files;
+        }
+
     }
 
     initiator_seg_type = FLAGS_initiator_seg_type;
@@ -271,6 +284,14 @@ void xferBenchConfig::printConfig() {
             std::cout << std::left << std::setw(60) << "Number of files (--num_files=N)" << ": "
                       << num_files << std::endl;
         }
+
+        // Print HF3FS options if backend is POSIX
+        if (backend == XFERBENCH_BACKEND_HF3FS) {
+            std::cout << std::left << std::setw(60) << "HF3FS filepath (--hf3fs_filepath=path)" << ": "
+                      << hf3fs_filepath << std::endl;
+            std::cout << std::left << std::setw(60) << "Number of files (--num_files=N)" << ": "
+                      << num_files << std::endl;
+        }
     }
     std::cout << std::left << std::setw(60) << "Initiator seg type (--initiator_seg_type=[DRAM,VRAM])" << ": "
               << initiator_seg_type << std::endl;
@@ -376,6 +397,7 @@ void xferBenchUtils::checkConsistency(std::vector<std::vector<xferBenchIOV>> &io
             len = iov.len;
 
             if ((xferBenchConfig::backend == XFERBENCH_BACKEND_GDS) ||
+                (xferBenchConfig::backend == XFERBENCH_BACKEND_HF3FS) ||
                 (xferBenchConfig::backend == XFERBENCH_BACKEND_POSIX)) {
                 if (xferBenchConfig::op_type == XFERBENCH_OP_READ) {
                     if (xferBenchConfig::initiator_seg_type == XFERBENCH_SEG_TYPE_VRAM) {
@@ -432,7 +454,6 @@ void xferBenchUtils::checkConsistency(std::vector<std::vector<xferBenchIOV>> &io
             } else if("READ" == xferBenchConfig::op_type) {
                 check_val = XFERBENCH_TARGET_BUFFER_ELEMENT;
             }
-
             rc = allBytesAre(addr, len, check_val);
             if (true != rc) {
                 std::cerr << "Consistency check failed\n" << std::flush;
