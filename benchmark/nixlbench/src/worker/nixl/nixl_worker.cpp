@@ -92,8 +92,8 @@ generateGusliConfigFile(const std::vector<GusliDeviceConfig> &devices) {
     return config.str();
 }
 
-xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<std::string> devices)
-    : xferBenchWorker(argc, argv) {
+xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices)
+    : xferBenchWorker() {
     seg_type = GET_SEG_TYPE(isInitiator());
 
     int rank;
@@ -109,7 +109,9 @@ xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<st
 
     rank = rt->getRank();
 
-    nixlAgentConfig dev_meta(enable_pt, false, 0, sync_mode);
+    nixlAgentConfig dev_meta;
+    dev_meta.useProgThread = enable_pt;
+    dev_meta.syncMode = sync_mode;
 
     agent = new nixlAgent(name, dev_meta);
 
@@ -194,6 +196,9 @@ xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<st
         }
         std::cout << "POSIX backend with API type: " << xferBenchConfig::posix_api_type
                   << std::endl;
+        backend_params["ios_pool_size"] = std::to_string(xferBenchConfig::posix_ios_pool_size);
+        backend_params["kernel_queue_size"] =
+            std::to_string(xferBenchConfig::posix_kernel_queue_size);
     } else if (0 == xferBenchConfig::backend.compare(XFERBENCH_BACKEND_GPUNETIO)) {
         std::cout << "GPUNETIO backend, network device " << devices[0] << " GPU device "
                   << xferBenchConfig::gpunetio_device_list << " OOB interface "
@@ -296,6 +301,7 @@ xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<st
         // Using default param values for AZURE_BLOB backend
         backend_params["account_url"] = xferBenchConfig::azure_blob_account_url;
         backend_params["container_name"] = xferBenchConfig::azure_blob_container_name;
+        backend_params["connection_string"] = xferBenchConfig::azure_blob_connection_string;
         std::cout << "AZURE_BLOB backend" << std::endl;
     } else {
         std::cerr << "Unsupported NIXLBench backend: " << xferBenchConfig::backend << std::endl;
@@ -307,6 +313,9 @@ xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<st
 }
 
 xferBenchNixlWorker::~xferBenchNixlWorker() {
+    delete rt;
+    rt = nullptr;
+
     if (agent) {
         delete agent;
         agent = nullptr;
@@ -609,8 +618,9 @@ xferBenchNixlWorker::initBasicDescFile(size_t buffer_size, xferFileState &fstate
     memset(buf, XFERBENCH_TARGET_BUFFER_ELEMENT, buffer_size);
 
     size_t offset = start_offset;
+    char *write_ptr = static_cast<char *>(buf);
     while (buffer_size > 0) {
-        ssize_t rc = pwrite(fd, buf, buffer_size, offset);
+        ssize_t rc = pwrite(fd, write_ptr, buffer_size, offset);
         if (rc < 0) {
             std::cerr << "Failed to write to file: " << fd << " with error: " << strerror(errno)
                       << std::endl;
@@ -619,6 +629,7 @@ xferBenchNixlWorker::initBasicDescFile(size_t buffer_size, xferFileState &fstate
 
         buffer_size -= rc;
         offset += rc;
+        write_ptr += rc;
     }
 
     free(buf);
@@ -699,6 +710,77 @@ xferBenchNixlWorker::cleanupBasicDescBlk(xferBenchIOV &iov) {
     // The block device backend handles the device lifecycle
 }
 
+bool
+xferBenchNixlWorker::ensureFileHasConsistencyData(const GusliDeviceConfig &device, size_t size) {
+    int flags = O_RDWR | O_CREAT | O_LARGEFILE;
+    if (xferBenchConfig::storage_enable_direct) flags |= O_DIRECT;
+
+    int fd = open(device.device_path.c_str(), flags, 0744);
+    if (fd < 0) {
+        std::cerr << "Failed to open GUSLI file: " << device.device_path << ": " << strerror(errno)
+                  << std::endl;
+        return false;
+    }
+
+    // Sample one page at the offset GUSLI will read from
+    void *check_buf;
+    bool needs_write = true;
+    if (allocateXferMemory(xferBenchConfig::page_size, &check_buf)) {
+        ssize_t rd = pread(fd, check_buf, xferBenchConfig::page_size, device.dev_offset);
+        if (rd == (ssize_t)xferBenchConfig::page_size) {
+            needs_write = false;
+            uint8_t *bytes = static_cast<uint8_t *>(check_buf);
+            for (ssize_t i = 0; i < rd; i++) {
+                if (bytes[i] != XFERBENCH_TARGET_BUFFER_ELEMENT) {
+                    needs_write = true;
+                    break;
+                }
+            }
+        }
+        free(check_buf);
+    }
+
+    if (needs_write) {
+        std::cout << "Warning: GUSLI file '" << device.device_path << "' at offset "
+                  << device.dev_offset << " does not contain expected pattern (0x" << std::hex
+                  << (int)XFERBENCH_TARGET_BUFFER_ELEMENT << std::dec << "). Overwriting."
+                  << std::endl;
+
+        void *buf;
+        if (!allocateXferMemory(size, &buf)) {
+            close(fd);
+            return false;
+        }
+        memset(buf, XFERBENCH_TARGET_BUFFER_ELEMENT, size);
+
+        size_t remaining = size;
+        size_t offset = device.dev_offset;
+        char *write_ptr = static_cast<char *>(buf);
+        while (remaining > 0) {
+            ssize_t rc = pwrite(fd, write_ptr, remaining, offset);
+            if (rc < 0) {
+                std::cerr << "Failed to write to " << device.device_path << " at offset " << offset
+                          << ": " << strerror(errno) << std::endl;
+                free(buf);
+                close(fd);
+                return false;
+            }
+            remaining -= rc;
+            offset += rc;
+            write_ptr += rc;
+        }
+        free(buf);
+    } else {
+        std::cout << "GUSLI file '" << device.device_path << "' at offset " << device.dev_offset
+                  << " already contains expected pattern (0x" << std::hex
+                  << (int)XFERBENCH_TARGET_BUFFER_ELEMENT << std::dec
+                  << "). Skipping initialization." << std::endl;
+    }
+
+    close(fd);
+    return true;
+}
+
 std::vector<std::vector<xferBenchIOV>>
 xferBenchNixlWorker::allocateMemory(int num_threads) {
     std::vector<std::vector<xferBenchIOV>> iov_lists;
@@ -763,17 +845,9 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
 
         if (xferBenchConfig::op_type == XFERBENCH_OP_READ) {
             for (auto &device : gusli_devices) {
-                if (device.device_type == 'F') {
-                    std::vector<xferFileState> fstate =
-                        createFileFds(getName(), 1, {device.device_path});
-                    if (!initBasicDescFile(
-                            xferBenchConfig::total_buffer_size, fstate[0], device.device_id)) {
-                        std::cerr << "Failed to create file: " << device.device_path << std::endl;
-                        for (auto &f : fstate) {
-                            close(f.fd);
-                        }
-                        exit(EXIT_FAILURE);
-                    }
+                if (device.device_type == 'F' &&
+                    !ensureFileHasConsistencyData(device, buffer_size)) {
+                    exit(EXIT_FAILURE);
                 }
             }
         }
@@ -1064,7 +1138,9 @@ xferBenchNixlWorker::exchangeIOV(const std::vector<std::vector<xferBenchIOV>> &l
                 }
             }
             res.push_back(remote_iov_list);
-            file_offset += block_size;
+            if (XFERBENCH_BACKEND_GUSLI == xferBenchConfig::backend) {
+                file_offset += block_size;
+            }
         }
     } else {
         for (const auto &local_iov : local_iovs) {
@@ -1268,13 +1344,10 @@ execTransfer(nixlAgent *agent,
         nixl_opt_args_t params;
         std::string target = xferBenchConfig::isStorageBackend() ? "initiator" : "target";
         if (!xferBenchConfig::isStorageBackend()) {
-            params.notifMsg = "0xBEEF";
-            params.hasNotif = true;
+            params.notif = "0xBEEF";
         }
 
         // Execute transfers
-        // GUSLI requires per-iteration request creation due to library bug
-        const bool recreate_per_iteration = (XFERBENCH_BACKEND_GUSLI == xferBenchConfig::backend);
         const int result = execTransferIterations(agent,
                                                   op,
                                                   local_desc,
@@ -1284,7 +1357,7 @@ execTransfer(nixlAgent *agent,
                                                   num_iter,
                                                   timer,
                                                   thread_stats,
-                                                  recreate_per_iteration);
+                                                  xferBenchConfig::recreate_xfer);
 
         if (__builtin_expect(result != 0, 0)) {
             ret = result;
